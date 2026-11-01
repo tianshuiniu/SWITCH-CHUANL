@@ -1,4 +1,4 @@
-name: Build Switch NRO
+name: Build Switch NRO (云上自动编译)
 
 on:
   push:
@@ -13,14 +13,35 @@ jobs:
       - name: 拉取代码
         uses: actions/checkout@v4
 
+      - name: 准备包管理器
+        run: |
+          pacman-key --init 2>/dev/null || true
+          pacman-key --populate devkitpro 2>/dev/null || true
+          dkp-pacman -Syy --noconfirm 2>/dev/null || pacman -Syy --noconfirm 2>/dev/null || true
+
       - name: 安装 Switch 需要的库
         run: |
-          dkp-pacman -S --noconfirm switch-dev switch-curl switch-mbedtls
+          for pkg in switch-dev switch-curl switch-mbedtls; do
+            echo ">>> 正在安装 $pkg ..."
+            if dkp-pacman -S --noconfirm --needed "$pkg" 2>/dev/null || pacman -S --noconfirm --needed "$pkg" 2>/dev/null; then
+              echo "    OK $pkg"
+            else
+              echo "    WARN $pkg 安装失败（先继续）"
+            fi
+          done
+
+      - name: 检查工具链
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          echo "gcc: $(which aarch64-none-elf-gcc 2>/dev/null || echo MISSING)"
+          echo "nx-makenro: $(which nx-makenro 2>/dev/null || echo MISSING)"
+          echo "switch_rules: $(ls $DEVKITPRO/libnx/switch_rules 2>/dev/null || echo MISSING)"
 
       - name: 编译出 .nro
         run: |
           export DEVKITPRO=/opt/devkitpro
           make
+          ls -la xcloud_switch.nro
 
       - name: 上传成品
         uses: actions/upload-artifact@v4
