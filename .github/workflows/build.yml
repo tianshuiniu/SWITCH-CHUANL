@@ -6,7 +6,251 @@ on:
   workflow_dispatch:
 
 jobs:
+  build:name: Build Switch NRO (自带全部源码)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
   build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - name: 生成全部源码并编译
+        run: |
+            set -e
+            pacman-key --init 2>/dev/null || true
+            pacman-key --populate devkitpro 2>/dev/null || true
+            dkp-pacman -Syy --noconfirm 2>/dev/null || pacman -Syy --noconfirm 2>/dev/null || true
+            for pkg in switch-dev switch-curl switch-mbedtls; do echo ">>> 安装 $pkg"; if dkp-pacman -S --noconfirm --needed "$pkg" 2>/dev/null || pacman -S --noconfirm --needed "$pkg" 2>/dev/null; then echo "    OK $pkg"; else echo "    WARN $pkg 安装失败（继续）"; fi; done
+            mkdir -p include/xcloud
+            cat > include/xcloud/config.h <<'XBEOF'
+            #pragma once
+            #include <string>
+            #include <vector>
+            #include <map>
+            
+            // 独立实现的 xCloud (Xbox Cloud Gaming) 串流客户端 —— 鉴权 + REST 接口层
+            // 仅用于研究 / 教育 / 互操作性，使用你自己的微软账号。
+            // 所有端点均来自对 xgo.nro 的静态分析核实，属公开 xCloud 协议。
+            
+            namespace xcloud {
+            
+            // 公开的个人客户端 ID（xCloud 网页版使用的同一个），非秘密封钥
+            constexpr const char* kClientId = "000000004c20a908";
+            constexpr const char* kScope    = "service::user.auth.xboxlive.com::MBI_SSL";
+            constexpr const char* kUserAgent = "xcloud-switch/0.1 (research)";
+            
+            // ---- 微软 / Xbox Live 端点 ----
+            constexpr const char* kMsDeviceCodeUrl   = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
+            constexpr const char* kMsTokenUrl        = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+            constexpr const char* kXblUserAuthUrl    = "https://user.auth.xboxlive.com/user/authenticate";
+            constexpr const char* kXstsAuthUrl       = "https://xsts.auth.xboxlive.com/xsts/authorize";
+            constexpr const char* kXcloudLoginUrl    = "https://xhome.gssv-play-prod.xboxlive.com/v2/login/user";
+            
+            // ---- 区域边缘节点（来自 xgo config.json 的 region_ips）----
+            struct Region {
+                std::string name;   // EASTUS 等
+                std::string label;  // 中文显示名
+                std::string ip;     // WebRTC 媒体边缘 IP
+                std::string lang;   // 默认语言
+            };
+            inline const std::vector<Region> kRegions = {
+                {"EASTUS",         "美国东部",   "203.41.44.20", "en"},
+                {"WESTUS",         "美国西部",   "68.224.57.1",  "en"},
+                {"WESTEUROPE",     "西欧",       "52.165.177.1", "en"},
+                {"JAPANEAST",      "日本东部",   "20.43.132.1",  "ja"},
+                {"KOREACENTRAL",   "韩国中部",   "20.200.225.1", "ko"},
+                {"SOUTHEASTASIA",  "东南亚",     "20.73.130.1",  "en"},
+                {"AUSTRALIAEAST",  "澳大利亚东部","20.195.85.1",  "zh"},
+            };
+            
+            // ---- WebRTC 连接辅助（来自 config.json）----
+            inline const std::vector<std::string> kStunServers = {
+                "stun:stun.miwifi.com:3478",
+                "stun:stun.chat.bilibili.com:3478",
+            };
+            inline const std::vector<std::string> kDohServers = {
+                "https://dns.alidns.com/resolve",
+                "https://1.12.12.12/dns-query",
+                "https://8.8.8.8/resolve",
+            };
+            inline const std::vector<int> kTeredoPorts = {9002};
+            
+            } // namespace xcloud
+            
+            XBEOF
+            mkdir -p include/xcloud
+            cat > include/xcloud/types.h <<'XBEOF'
+            #pragma once
+            #include <string>
+            
+            namespace xcloud {
+            
+            // 微软账号 OAuth2 令牌（device-code 流程）
+            struct MsaTokens {
+                std::string accessToken;
+                std::string refreshToken;
+                long expiresIn = 0;
+                std::string tokenType = "Bearer";
+            };
+            
+            // Xbox Live 用户令牌（user.auth.xboxlive.com）
+            struct XboxUserAuth {
+                std::string token;  // "u=..."
+                std::string uhs;    // user hash，需与 XSTS 的 uhs 一致
+            };
+            
+            // Xbox Live XSTS 令牌（xsts.auth.xboxlive.com，relying party = gssv）
+            struct XboxXsts {
+                std::string token;  // "t=..."
+                std::string uhs;
+                std::string gti;    // 来自 DisplayClaims，GSSV 登录需用
+                std::string gsp;    // 来自 DisplayClaims
+                std::string gamertag;
+            };
+            
+            // xCloud (GSSV) 登录会话
+            struct CloudSession {
+                std::string serverId;
+                std::string gsToken;
+                std::string baseUri;     // 形如 https://<region>.gssv-play-prod.xboxlive.com
+                std::string expiresAt;
+                std::string xstsToken;   // 原始 XSTS，WebRTC 连接时仍要用
+                std::string gamertag;
+            };
+            
+            } // namespace xcloud
+            
+            XBEOF
+            mkdir -p include/xcloud
+            cat > include/xcloud/http_client.h <<'XBEOF'
+            #pragma once
+            #include <string>
+            #include <map>
+            
+            namespace xcloud {
+            
+            struct HttpResponse {
+                long status = 0;       // HTTP 状态码，0 表示请求层失败
+                std::string body;
+                std::string error;     // 非空表示 libcurl / 传输层错误
+            };
+            
+            // 极简同步 HTTP 客户端（libcurl 封装）。
+            // Switch 端可替换为 libnx 的 HTTP 后端，接口不变。
+            class HttpClient {
+            public:
+                HttpClient();
+                ~HttpClient();
+            
+                void setUserAgent(const std::string& ua);
+                void setTimeoutSec(int sec);
+            
+                HttpResponse get(const std::string& url,
+                                 const std::map<std::string, std::string>& headers = {});
+                HttpResponse post(const std::string& url,
+                                 const std::string& body,
+                                 const std::string& contentType = "application/json",
+                                 const std::map<std::string, std::string>& headers = {});
+            
+            private:
+                HttpResponse request(const std::string& method, const std::string& url,
+                                     const std::string& body, const std::string& ctype,
+                                     const std::map<std::string, std::string>& headers);
+                std::string userAgent_ = "xcloud-switch/0.1";
+                int timeoutSec_ = 30;
+            };
+            
+            } // namespace xcloud
+            
+            XBEOF
+            mkdir -p include/xcloud
+            cat > include/xcloud/auth.h <<'XBEOF'
+            #pragma once
+            #include "xcloud/types.h"
+            #include <string>
+            
+            namespace xcloud {
+            
+            // 鉴权流程封装：
+            //   MSA(device-code) -> Xbox User Auth -> XSTS(gssv) -> xCloud(GSSV) 登录
+            // 返回 CloudSession 供后续串流信令使用。
+            class Auth {
+            public:
+                // 走 device-code 流程，过程中会在控制台打印用户码与验证链接，并轮询直至用户登录。
+                // 返回 MSA 访问/刷新令牌。
+                static MsaTokens loginMsa();
+            
+                // user.auth.xboxlive.com：用 MSA 访问令牌换用户令牌（RPS ticket）。
+                static XboxUserAuth authorizeUser(const std::string& msaAccessToken);
+            
+                // xsts.auth.xboxlive.com：用用户令牌换 XSTS（relying party = gssv）。
+                static XboxXsts authorizeXsts(const std::string& userToken);
+            
+                // xhome.gssv-play-prod.xboxlive.com/v2/login/user：用 XSTS 登录 xCloud。
+                static CloudSession loginCloud(const XboxXsts& xsts, const std::string& gamertag);
+            
+                // 一站式：device-code 登录并拿到 CloudSession。
+                static CloudSession fullLogin();
+            };
+            
+            // 工具：把字符串做 application/x-www-form-urlencoded 编码（用于表单体）。
+            std::string urlEncode(const std::string& in);
+            
+            } // namespace xcloud
+            
+            XBEOF
+            mkdir -p include/xcloud
+            cat > include/xcloud/stream.h <<'XBEOF'
+            #pragma once
+            #include "xcloud/types.h"
+            #include "xcloud/config.h"
+            #include <nlohmann/json.hpp>
+            #include <string>
+            
+            namespace xcloud {
+            
+            // xCloud 串流信令 / 配置接口层（WebRTC 媒体传输为第二阶段，此处只做 REST 与会话构造）
+            class Stream {
+            public:
+                // 拉取串流会话配置（分辨率档位、输入能力、特性开关等）
+                static nlohmann::json getConfiguration(const CloudSession& s);
+            
+                // 选择一个区域（返回引用；不拷贝）
+                static const Region& pickRegion(const std::string& name);
+            
+                // 默认区域（东南亚/澳大利亚对中文用户友好，按需要改）
+                static const Region& defaultRegion();
+            
+                // 构造一个 WebRTC SDP offer 模板（H.265 视频 + Opus 音频 + transport-cc）。
+                // 注意：真正的 offer 应由 WebRTC 栈（如 libdatachannel）在连接时生成，
+                // 这里仅提供符合 xCloud 协商格式的参考模板，供第二阶段对接与联调。
+                static std::string buildSdpOfferTemplate(const std::string& ufrag,
+                                                         const std::string& pwd,
+                                                         const std::string& fingerprint);
+            };
+            
+            } // namespace xcloud
+            
+            XBEOF
+            mkdir -p third_party/nlohmann
+            DL="https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"; if command -v curl >/dev/null 2>&1; then curl -fsSL -o third_party/nlohmann/json.hpp "$DL"; elif command -v wget >/dev/null 2>&1; then wget -q -O third_party/nlohmann/json.hpp "$DL"; else python3 -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "$DL" third_party/nlohmann/json.hpp; fi
+            ls -l third_party/nlohmann/json.hpp
+            echo "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAEAAQADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDweiiiv3M/LAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAK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p/8A6Ux1+ydfjZ8C/wDktvw9/wCxh0//ANKY6/ZOs+Jv41P0f5l5J/Dn6n4d3/8Ax/XP/XRv5moK/ZJvgV8NXYs3w98KsxOSToltk/8AjlJ/woj4af8ARPPCn/gktv8A4iu5cS0f+fb+9HL/AGJU/nR+N1em/A/4A+Jvjj4ltrLS7KaDRxIBe6u8ZEFumfm+Y8M+OiDkn0GSP1Ktvgn8O7OQSW/gLwxBIDkPHo9upH4hK3NZ8QaD4G0kT6pqGn6DpsK4V7mVIIlA7DJA/AVhW4jc48uHp+8+/wDl1NaeSqL5qs9F/W5Y0HRLPwxoWnaRYR+TYafbR2sEefuxooVR+QFfk7+1N8R4Pij8cfEmsWUom0yKRbKzkU5V4ogE3g+jMGYezCvof9qP9uKw1rQ77wj8O55Zku1aC910qYx5Z4ZIAcHkZBcgcZ25yGHw/XVkWXVKDlia6tJ6JPfzbOfNcZCqlQpO6W4UUUV9gfOhRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQB2ln8a/iHp9pBa2vj3xPbWsCLFFBDrFwiRoBhVVQ+AAAAAKxvE3jfxH41kgk8Q6/qmvSW4Kwtqd7JcmMHGQpdjjOB09KxKKyVKnF8yik/Q0dSbVm3YKKKK1MwooooA3vDPj7xP4KS4Xw94j1bQVuCpmXTL6W2EpGdu7YwzjJxn1Nat98afiFqdlPZ3njzxNd2lxG0U0E+sXDxyIwwyspfBBBIINcZRWTpU5PmcVf0NFUmlZN2J7C/udLvre9sriW0vLaRZobiBykkTqcqysOQQQCCOQRXZf8L3+Jf/RQ/Ff/AIO7n/4uuGopypwn8UUxRnKPwux3P/C9/iX/ANFD8V/+Du5/+Lo/4Xv8S/8Aoofiv/wd3P8A8XXDUVHsKP8AIvuRXtan8z+87O5+NfxDvEKXHjzxNOh6rJrFww/V65XUNSvNWuDcX11PeTnrLcSF2P4k5qtRVxpwh8KSJlOUvidwooorQgKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA//2Q==" | base64 -d > icon.jpg
+            echo "=== 文件检查 ==="
+            ls -la include/xcloud src third_party/nlohmann icon.jpg
+            export DEVKITPRO=/opt/devkitpro
+            make
+            ls -la xcloud_switch.nro
+      - name: 上传成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcloud_switch.nro
+          path: xcloud_switch.nro
+
     runs-on: ubuntu-latest
     container: devkitpro/devkita64:latest
     steps:
